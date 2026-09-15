@@ -59,15 +59,17 @@ def build_application(bot_settings: BotSettings, ig_settings: Settings) -> tuple
     async def _on_startup() -> None:
         logger.info("ربات آماده است؛ در حال لاگینِ پس‌زمینه به اینستاگرام ...")
         try:
+            # ⚠️ نامِ دستور فقط a-z 0-9 _ مجاز است (حداکثر ۳۲ کاراکتر)؛
+            # توضیحِ « <username> » فقط در description می‌آید
             await bot.set_my_commands(
                 [
                     BotCommand(command="start", description="شروع و منو"),
-                    BotCommand(command="page <username>", description="تحلیل یک پیج"),
-                    BotCommand(command="tag <hashtag>", description="تحلیل یک هشتگ"),
+                    BotCommand(command="page", description="تحلیل پیج: /page username"),
+                    BotCommand(command="tag", description="تحلیل هشتگ: /tag #hashtag"),
                     BotCommand(command="history", description="هیزتوری من"),
                     BotCommand(command="menu", description="نمایش منو"),
                     BotCommand(command="help", description="راهنما"),
-                    BotCommand(command="cancel", description="لغوی واردکردن"),
+                    BotCommand(command="cancel", description="لغوِ واردکردن"),
                 ]
             )
         except Exception as exc:  # noqa: BLE001 — تزئینی است
