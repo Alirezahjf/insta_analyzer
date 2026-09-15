@@ -65,7 +65,7 @@ class CodeProvider:
         if len(code) < 6:
             return None
         self.code_file.unlink(missing_ok=True)  # مصرف شد
-        return code[:8]
+        return code[:6]  # کدهای اینستاگرام ۶ رقمی‌اند؛ رقمِ اضافه = ورودیِ اشتباه
 
     def _wait_for_file(self, choice: ChallengeChoice) -> Optional[str]:
         if self.wait_seconds <= 0:
