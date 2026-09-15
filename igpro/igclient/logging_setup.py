@@ -28,8 +28,8 @@ class SecretRedactingFilter(logging.Filter):
         return True
 
 
-def setup_logging(level: str = "INFO", log_dir: Path | None = None, name: str = "igpro") -> logging.Logger:
-    log_dir = log_dir or (Path.cwd() / "logs")
+def setup_logging(level: str = "INFO", log_dir: Path | str | None = None, name: str = "igpro") -> logging.Logger:
+    log_dir = Path(log_dir) if log_dir is not None else (Path.cwd() / "logs")
     log_dir.mkdir(parents=True, exist_ok=True)
 
     logger = logging.getLogger(name)

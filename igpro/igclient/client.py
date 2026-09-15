@@ -8,7 +8,7 @@ import logging
 import random
 import time
 from enum import Enum
-from typing import Any, Callable, Dict, Optional, TypeVar
+from typing import Any, Callable, Optional, TypeVar
 
 from instagrapi import Client
 from instagrapi.exceptions import (
@@ -18,6 +18,8 @@ from instagrapi.exceptions import (
     ClientError,
     ClientLoginRequired,
     ClientRequestTimeout,
+    ClientThrottledError,
+    ClientUnauthorizedError,
     LoginRequired,
     PleaseWaitFewMinutes,
     PrivateError,
@@ -35,7 +37,9 @@ logger = logging.getLogger("igpro.client")
 T = TypeVar("T")
 
 # خطاهایی که یعنی سشن واقعاً مرده است → حذف فایل و تلاش از روش بعدی
-AUTH_ERRORS = (LoginRequired, ClientLoginRequired, ChallengeRequired, BadPassword)
+# (401 Unauthorized = سشن از سمت سرور بی‌اعتبار شده ⇒ ورودِ مجدد درست‌ترین راه است)
+AUTH_ERRORS = (LoginRequired, ClientLoginRequired, ChallengeRequired, BadPassword,
+               ClientUnauthorizedError)
 # خطاهای گذرا → فایل سشن را دست‌نخورده نگه می‌داریم و فقط صبر/تلاشِ مجدد می‌کنیم
 TRANSIENT_ERRORS = (
     ClientConnectionError,
@@ -43,6 +47,13 @@ TRANSIENT_ERRORS = (
     RateLimitError,
     PleaseWaitFewMinutes,
 )
+# «لطفاً چند دقیقه صبر کنید» — ریت‌لیمیتِ سِروری؛ بازتلاشِ فوری بی‌فایده است
+# و خودِ آستانه را پایین می‌کشد. (ClientThrottledError = همان 429)
+RATE_LIMITED_ERRORS = (PleaseWaitFewMinutes, RateLimitError, ClientThrottledError)
+
+# صبرِ اولین بازتلاش بعد از ریت‌لیمیت (ثانیه)
+RATE_LIMIT_WAIT_MIN = 60
+RATE_LIMIT_WAIT_JITTER = 20
 
 
 class LoginMethod(str, Enum):
@@ -53,6 +64,10 @@ class LoginMethod(str, Enum):
 
 class AuthenticationError(RuntimeError):
     """هیچ روشی برای ورود موفق نبود."""
+
+
+class RateLimited(RuntimeError):
+    """اکانت/IP هم‌اکنون توسط اینستاگرام ریت‌لیمیت شده؛ صبرِ چند دقیقه لازم است."""
 
 
 class IGClient:
@@ -350,17 +365,36 @@ class IGClient:
 
     # ------------------------------------------------------- فراخوانی امنِ API
     def safe_call(self, fn: Callable[..., T], *args: Any, attempts: int = 3, **kwargs: Any) -> T:
-        """اجرا با بازتلاش برای خطاهای گذرا (backoff نمایی + jitter) و ورودِ مجدد خودکار."""
+        """اجرا با بازتلاش برای خطاهای گذرا (backoff نمایی + jitter) و ورودِ مجدد خودکار.
+
+        استثنای مهم: خطاهای «ریت‌لیمیت» (PleaseWaitFewMinutes / 429 / RateLimit)
+        فقط یک بار و بعد از ~۶۰ ثانیه دوباره امتحان می‌شوند؛ بازتلاش‌های ۵-۲۱ ثانیه‌ای
+        در این حالت فقط درخواستِ بیشتر به یک اکانتِ محدودشده فرستادن است.
+        """
         last_exc: Optional[BaseException] = None
+        rate_limited_seen = False
         for attempt in range(1, attempts + 1):
             try:
                 return self.with_transport_fallback(fn, *args, **kwargs)
             except AUTH_ERRORS as exc:
-                if attempt == attempts or not self.store.exists():
+                # حتی بدون فایلِ سشن هم ورودِ مجدد ممکن است (sessionid/password از env)
+                if attempt == attempts:
                     raise
                 logger.warning("خطای احراز هویت (%s)؛ تلاش برای ورود مجدد ...", type(exc).__name__)
                 self.client.authorization_data = {}
                 self.login(fresh=False)
+            except RATE_LIMITED_ERRORS as exc:
+                if rate_limited_seen or attempt == attempts:
+                    raise RateLimited(
+                        "اینستاگرام هم‌اکنون ریت‌لیمیت کرده است (Please wait a few minutes)."
+                    ) from exc
+                rate_limited_seen = True
+                wait = RATE_LIMIT_WAIT_MIN + random.uniform(0, RATE_LIMIT_WAIT_JITTER)
+                logger.warning(
+                    "ریت‌لیمیت (%s)؛ %.0f ثانیه صبر و یک تلاشِ آخر ...",
+                    type(exc).__name__, wait,
+                )
+                time.sleep(wait)
             except TRANSIENT_ERRORS as exc:
                 last_exc = exc
                 wait = min(60, 5 * (2 ** (attempt - 1))) + random.uniform(0, 2)
@@ -369,7 +403,7 @@ class IGClient:
                 if attempt == attempts:
                     break
                 time.sleep(wait)
-            except UserNotFound as exc:
+            except UserNotFound:
                 raise
         assert last_exc is not None
         raise last_exc

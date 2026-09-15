@@ -80,8 +80,10 @@ class Settings:
         load_dotenv()
         state_dir = Path(env_str("IG_STATE_DIR", str(DEFAULT_STATE_DIR))).expanduser()
         state_dir.mkdir(parents=True, exist_ok=True)
+        # پیش‌فرضِ فایل سشن از state_dir ساخته می‌شود تا IG_STATE_DIR واقعاً همه‌چیز را جابه‌جا کند
+        default_session = state_dir / "session.json"
         return cls(
-            session_path=Path(env_str("IG_SESSION_FILE", str(DEFAULT_SESSION))).expanduser(),
+            session_path=Path(env_str("IG_SESSION_FILE", str(default_session))).expanduser(),
             state_dir=state_dir,
             code_file=state_dir / "code.txt",
             log_dir=state_dir / "logs",

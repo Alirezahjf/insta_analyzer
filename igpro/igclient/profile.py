@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from instagrapi import Client
 
@@ -186,7 +186,8 @@ def _collect_media(cl: Client, user_id: str, amount: int, include_reels: bool) -
     برای گرفتنِ جدیدترین N پست، گرفتنِ N مورد از هر منبع کافی است (جدیدترینِ کل،
     قطعاً داخلِ اجتماعِ «N تایِ اول هر منبع» است).
     """
-    wanted = max(1, min(int(amount or 1), MAX_SCAN))
+    # مقدار منفی/صفر را به ۱ محدود می‌کنیم (اسلایسِ منفی در انتها پرتخرج‌ساز است)
+    wanted = max(1, min(int(amount) if amount else 1, MAX_SCAN))
 
     logger.info("دریافت %d پستِ آخر ...", wanted)
     media_list = list(cl.user_medias(user_id, amount=wanted) or [])
@@ -204,7 +205,7 @@ def _collect_media(cl: Client, user_id: str, amount: int, include_reels: bool) -
             seen.add(pk)
             unique.append(media)
     unique.sort(key=lambda m: str(_safe(m, "taken_at", default="") or ""), reverse=True)
-    return unique[: amount or len(unique)]
+    return unique[:wanted]
 
 
 def last_posts(cl: Client, target: str, amount: int = 2, detail: bool = True,
