@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Secrets & state (sessionid = دسترسی کامل به اکانت؛ هرگز وارد گیت نشود)
+.env
+igpro/.env
+igpro/state/
+*.db
+*.db-journal
+
+# Reference library sources (دانلود‌شده برای بررسی، نه بخشی از پروژه)
+instagrapi_src/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

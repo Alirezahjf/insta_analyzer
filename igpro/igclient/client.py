@@ -8,7 +8,7 @@ import logging
 import random
 import time
 from enum import Enum
-from typing import Any, Callable, Dict, Optional, TypeVar
+from typing import Any, Callable, Optional, TypeVar
 
 from instagrapi import Client
 from instagrapi.exceptions import (
@@ -369,7 +369,7 @@ class IGClient:
                 if attempt == attempts:
                     break
                 time.sleep(wait)
-            except UserNotFound as exc:
+            except UserNotFound:
                 raise
         assert last_exc is not None
         raise last_exc

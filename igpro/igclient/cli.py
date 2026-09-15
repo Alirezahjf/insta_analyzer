@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import logging
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -138,7 +137,7 @@ def main(argv: Optional[list] = None) -> int:
 
     from .logging_setup import setup_logging
     logger = setup_logging(settings.log_level, settings.log_dir)
-    logger.debug("تنظیمات barگذاری شد.")
+    logger.debug("تنظیمات بارگذاری شد.")
 
     if args.command == "session-info":
         store_meta = IGClient(settings).store.metadata()
@@ -188,7 +187,10 @@ def main(argv: Optional[list] = None) -> int:
                 _print_posts(data)
         elif args.command == "medias":
             user_id = _target_user_id(ig, args.username)
-            data = ig.safe_call(prof.medias, ig.client, user_id, args.amount)
+            # سقف ایمنی: amount=0 در instagrapi یعنی «همه‌ی پست‌ها» (صدها درخواست!)
+            amount = args.amount if args.amount and args.amount > 0 else 12
+            amount = min(amount, prof.MAX_SCAN)
+            data = ig.safe_call(prof.medias, ig.client, user_id, amount)
             _print(data, args.json, f"پست‌ها: {len(data)} مورد")
         elif args.command == "security":
             _print(ig.safe_call(prof.security_info, ig.client), args.json, "امنیت حساب")
