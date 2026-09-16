@@ -16,6 +16,7 @@ from typing import Dict, Optional, Tuple
 from aiogram import F, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.filters.base import Filter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, Message
@@ -25,7 +26,7 @@ from bot.config import BotSettings
 from bot.database import Database
 from bot.engine import IgEngine, ReportAborted, ReportError
 from bot.progress import ProgressReporter
-from igclient.client import RateLimited
+from igclient.client import AuthenticationError, RateLimited
 
 logger = logging.getLogger("igpro.bot.handlers")
 
@@ -43,10 +44,17 @@ class TagFlow(StatesGroup):
     waiting_tag = State()
 
 
-class HasState:
-    """فیلتر: فقط وقتی کاربر در یک state فعال باشد (aiogram 3.31: raw_state از kwargs می‌آید)."""
+class HasState(Filter):
+    """فیلتر: فقط وقتی کاربر در یک state فعال باشد (aiogram 3.31: raw_state از kwargs می‌آید).
 
-    async def __call__(self, obj, raw_state: Optional[str] = None) -> bool:
+    ⚠️ باید زیرکلاسِ ``aiogram.filters.base.Filter`` باشد: یک کلاسِ ساده با
+    ``async __call__`` از نظرِ aiogram «غیرهمگام» شناخته می‌شود (iscoroutinefunction
+    روی نمونه‌ی کلاس False است)، در نتیجه در رشته‌ی جدا صدا زده می‌شد و کروتینش
+    هرگز اَویت نمی‌شد («همیشه درست» + هشدارِ کروتینِ معلق). زیرکلاسِ Filter مسیرِ
+    درستِ ``await`` را فعال می‌کند.
+    """
+
+    async def __call__(self, obj, raw_state: Optional[str] = None) -> bool:  # type: ignore[override]
         return raw_state is not None
 
 
@@ -134,6 +142,16 @@ def build_router(settings: BotSettings, db: Database, engine: IgEngine) -> Route
             await msg.answer(
                 "⏰ گزارش به‌دلیل پایانِ مهلت متوقف شد. دوباره امتحان کنید.",
                 reply_markup=fmt.retry_menu_keyboard(),
+            )
+        except AuthenticationError as exc:
+            logger.warning("گزارش %s:%s با شکستِ احراز هویت مواجه شد", kind, target)
+            db.add_history(user_id, kind, target, "auth_error", None, {**meta, "error": str(exc)})
+            await msg.answer(
+                "🔐 <b>ورود به اینستاگرام در حال حاضر ممکن نیست.</b>\n"
+                "هیچ‌کدام از روش‌های ورود (سشن / sessionid / پسورد) موفق نشد.\n"
+                "• چند دقیقه صبر کنید و دوباره امتحان کنید (احتمال چالش/ریت‌لیمیت).\n"
+                "• اگر مشکل ادامه داشت، اعتبارنامه‌ها را در <code>.env</code> بررسی کنید.\n"
+                f"<i>جزئیات فنی: {str(exc)[:160]}</i>"
             )
         except RateLimited:
             logger.warning("گزارش %s:%s ریت‌لیمیت شد", kind, target)

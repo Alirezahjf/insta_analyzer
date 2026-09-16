@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramAPIError
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import BotCommand
 from aiogram.types.error_event import ErrorEvent
@@ -21,6 +23,71 @@ from igclient.config import Settings
 logger = logging.getLogger("igpro.bot.app")
 
 BG_LOGIN_TIMEOUT = 300.0
+
+# قوانین تلگرام برای منوی دستورات (سرور کلِ فهرست را با یک خطا رد می‌کند):
+#   نامِ دستور: فقط a-z 0-9 _ و ۱ تا ۳۲ کاراکتر
+#   توضیح:      ۳ تا ۲۵۶ کاراکتر
+BOT_COMMAND_RE = re.compile(r"^[a-z0-9_]{1,32}$")
+
+# فهرستِ دستورات — قبل از ارسال اعتبارسنجی می‌شود (نگهبانِ بازگشتِ خطا به نسخه‌های قدیمی)
+BOT_COMMANDS = [
+    BotCommand(command="start", description="شروع و منو"),
+    BotCommand(command="page", description="تحلیل پیج: /page username"),
+    BotCommand(command="tag", description="تحلیل هشتگ: /tag #hashtag"),
+    BotCommand(command="history", description="هیزتوری من"),
+    BotCommand(command="menu", description="نمایش منو"),
+    BotCommand(command="help", description="راهنما"),
+    BotCommand(command="cancel", description="لغوِ واردکردن"),
+]
+
+
+def validate_bot_commands(commands: list[BotCommand]) -> list[BotCommand]:
+    """فیلترِ محلی: دستورهای نامعتبر را قبل از ارسال حذف و لاگ می‌کند."""
+    valid: list[BotCommand] = []
+    for cmd in commands:
+        name = (cmd.command or "").strip()
+        desc = (cmd.description or "").strip()
+        if not BOT_COMMAND_RE.match(name):
+            logger.warning("دستور %r نامعتبر است (فقط a-z/0-9/_ تا ۳۲ کاراکتر) — حذف شد.", name)
+            continue
+        if not (3 <= len(desc) <= 256):
+            logger.warning("توضیح دستور /%s نامعتبر است (۳ تا ۲۵۶ کاراکتر) — حذف شد.", name)
+            continue
+        if name != cmd.command or desc != cmd.description:
+            cmd = BotCommand(command=name, description=desc)
+        valid.append(cmd)
+    return valid
+
+
+async def register_bot_commands(bot: Bot, commands: list[BotCommand]) -> None:
+    """ثبت منوی دستورات با تحملِ خطا.
+
+    اگر ثبتِ یکجا شکست خورد (خطای 400 تلگرام مثل BOT_COMMAND_INVALID)، دستورات
+    یکی‌یکی اضافه می‌شوند تا دستورِ مشکل‌دار شناسایی و حذف شود و بقیه ثبت بمانند.
+    """
+    commands = validate_bot_commands(commands)
+    if not commands:
+        logger.warning("هیچ دستور معتبری برای ثبت وجود ندارد.")
+        return
+    try:
+        await bot.set_my_commands(commands)
+        logger.info("منوی دستورات ثبت شد (%d دستور).", len(commands))
+        return
+    except TelegramAPIError as exc:
+        logger.warning("ثبتِ یکجای منوی دستورات ناموفق بود (%s) — ثبتِ تک‌به‌تک.", exc)
+
+    accepted: list[BotCommand] = []
+    for cmd in commands:
+        trial = accepted + [cmd]
+        try:
+            await bot.set_my_commands(trial)
+            accepted = trial
+        except TelegramAPIError as exc:
+            logger.warning("دستور /%s توسط تلگرام رد شد (%s) — حذف شد.", cmd.command, exc)
+    if accepted:
+        logger.info("منوی دستورات ثبت شد (%d از %d دستور).", len(accepted), len(commands))
+    else:
+        logger.warning("ثبت منوی دستورات به‌طور کامل ناموفق بود — ربات بدون منو ادامه می‌دهد.")
 
 
 async def _background_login(ig: IGClient) -> None:
@@ -68,20 +135,8 @@ def build_application(bot_settings: BotSettings, ig_settings: Settings) -> tuple
             logger.info("ربات آماده است؛ در حال لاگینِ پس‌زمینه به اینستاگرام ...")
             do_bg_login = True
         try:
-            # ⚠️ نامِ دستور فقط a-z 0-9 _ مجاز است (حداکثر ۳۲ کاراکتر)؛
-            # توضیحِ « <username> » فقط در description می‌آید
-            await bot.set_my_commands(
-                [
-                    BotCommand(command="start", description="شروع و منو"),
-                    BotCommand(command="page", description="تحلیل پیج: /page username"),
-                    BotCommand(command="tag", description="تحلیل هشتگ: /tag #hashtag"),
-                    BotCommand(command="history", description="هیزتوری من"),
-                    BotCommand(command="menu", description="نمایش منو"),
-                    BotCommand(command="help", description="راهنما"),
-                    BotCommand(command="cancel", description="لغوِ واردکردن"),
-                ]
-            )
-        except Exception as exc:  # noqa: BLE001 — تزئینی است
+            await register_bot_commands(bot, BOT_COMMANDS)
+        except Exception as exc:  # noqa: BLE001 — تزئینی است؛ ربات بدون منو هم کار می‌کند
             logger.warning("ثبت منوی دستورات ناموفق: %s", exc)
         if do_bg_login:
             asyncio.create_task(_background_login(ig))

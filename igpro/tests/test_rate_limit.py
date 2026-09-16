@@ -136,3 +136,88 @@ def test_bot_shows_ratelimited_message(tmp_path):
         db.close()
 
     asyncio.run(scenario())
+
+
+def _make_client(tmp_path, monkeypatch) -> IGClient:
+    monkeypatch.setenv("IG_STATE_DIR", str(tmp_path))
+    for v in ("IG_SESSION_ID", "IG_USERNAME", "IG_PASSWORD", "IG_TOTP_SEED", "IG_2FA_CODE"):
+        monkeypatch.delenv(v, raising=False)
+    return IGClient(Settings.from_env())
+
+
+def test_safe_call_fast_fails_during_cooldown(tmp_path, monkeypatch):
+    """در پنجره‌ی خنک‌شدن، حتی یک درخواست هم به سرور نمی‌رود."""
+    ig = _make_client(tmp_path, monkeypatch)
+    ig._mark_throttled(60)
+    calls = {"n": 0}
+
+    def fn():
+        calls["n"] += 1
+        return "ok"
+
+    with pytest.raises(RateLimited):
+        ig.safe_call(fn)
+    assert calls["n"] == 0
+
+
+def test_login_refuses_when_throttled(tmp_path, monkeypatch):
+    """بعد از ریت‌لیمیت، زنجیره‌ی لاگین به‌جای پسوردزدن، سریع شکست می‌خورد."""
+    ig = _make_client(tmp_path, monkeypatch)
+    ig._mark_throttled(60)
+    with pytest.raises(RateLimited):
+        ig.login()
+
+
+def test_ratelimit_sets_cooldown(tmp_path, monkeypatch):
+    """بعد از شکستِ ریت‌لیمیت، پنجره‌ی خنک‌شدن فعال می‌شود."""
+    ig = _make_client(tmp_path, monkeypatch)
+    monkeypatch.setattr(cc.time, "sleep", lambda s: None)
+
+    def fn():
+        raise PleaseWaitFewMinutes(Exception("rl"))
+
+    assert not ig.throttled
+    with pytest.raises(RateLimited):
+        ig.safe_call(fn)
+    assert ig.throttled
+    assert ig.throttle_remaining() > 0
+
+
+def test_sessionid_login_swallows_network_errors(tmp_path, monkeypatch):
+    """خطاهای خامِ شبکه (مثل TooManyRedirects در لاگینِ 3.0.2) نباید بالا بزنند؛
+    زنجیره باید به روشِ بعدی برود."""
+    import requests as _requests
+    ig = _make_client(tmp_path, monkeypatch)
+    monkeypatch.setenv("IG_SESSION_ID", "25037423982" + "a" * 60)
+    ig = IGClient(Settings.from_env())
+
+    def boom(sessionid):
+        raise _requests.exceptions.TooManyRedirects("Exceeded 30 redirects.")
+
+    monkeypatch.setattr(ig.client, "login_by_sessionid", boom)
+    assert ig._login_with_sessionid() is False  # بدون استثنا، زنجیره ادامه دارد
+
+
+def test_sessionid_login_throttle_does_not_burn_password(tmp_path, monkeypatch):
+    """ریت‌لیمیت در لاگینِ sessionid ⇒ پنجره‌ی خنک‌شدن؛ ادامه‌ی زنجیره = شکستِ سریع."""
+    ig = _make_client(tmp_path, monkeypatch)
+    monkeypatch.setenv("IG_SESSION_ID", "25037423982" + "a" * 60)
+    monkeypatch.setenv("IG_USERNAME", "u")
+    monkeypatch.setenv("IG_PASSWORD", "p")
+    ig = IGClient(Settings.from_env())
+
+    def throttled(sessionid):
+        raise ClientThrottledError(Exception("429"))
+
+    password_calls = {"n": 0}
+
+    def fake_password_login(*a, **k):
+        password_calls["n"] += 1
+        return True
+
+    monkeypatch.setattr(ig.client, "login_by_sessionid", throttled)
+    monkeypatch.setattr(ig.client, "login", fake_password_login)
+    with pytest.raises(RateLimited):
+        ig.login()
+    assert password_calls["n"] == 0  # هیچ تلاش پسوردی زیرِ ریت‌لیمیت انجام نشد
+    assert ig.throttled

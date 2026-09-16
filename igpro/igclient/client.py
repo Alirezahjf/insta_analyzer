@@ -10,12 +10,15 @@ import time
 from enum import Enum
 from typing import Any, Callable, Optional, TypeVar
 
+import requests
+
 from instagrapi import Client
 from instagrapi.exceptions import (
     BadPassword,
     ChallengeRequired,
     ClientConnectionError,
     ClientError,
+    ClientJSONDecodeError,
     ClientLoginRequired,
     ClientRequestTimeout,
     ClientThrottledError,
@@ -40,20 +43,30 @@ T = TypeVar("T")
 # (401 Unauthorized = سشن از سمت سرور بی‌اعتبار شده ⇒ ورودِ مجدد درست‌ترین راه است)
 AUTH_ERRORS = (LoginRequired, ClientLoginRequired, ChallengeRequired, BadPassword,
                ClientUnauthorizedError)
-# خطاهای گذرا → فایل سشن را دست‌نخورده نگه می‌داریم و فقط صبر/تلاشِ مجدد می‌کنیم
+# خطاهای گذرا → فایل سشن را دست‌نخورده نگه می‌داریم و فقط صبر/تلاشِ مجدد می‌کنیم.
+# نکته: ClientJSONDecodeError یعنی سرور به‌جای JSON صفحه‌ی HTML فرستاده (چالش/خطای لحظه‌ای
+# یا پاسخِ پروکسی) — معمولاً گذرا است؛ پس سشن را به‌خاطرش حذف نمی‌کنیم.
 TRANSIENT_ERRORS = (
     ClientConnectionError,
     ClientRequestTimeout,
+    ClientJSONDecodeError,
     RateLimitError,
     PleaseWaitFewMinutes,
 )
 # «لطفاً چند دقیقه صبر کنید» — ریت‌لیمیتِ سِروری؛ بازتلاشِ فوری بی‌فایده است
 # و خودِ آستانه را پایین می‌کشد. (ClientThrottledError = همان 429)
 RATE_LIMITED_ERRORS = (PleaseWaitFewMinutes, RateLimitError, ClientThrottledError)
+# استثناهای خامِ requests که خودِ instagrapi آن‌ها را نمی‌پیچد — نمونه‌ی واقعی از لاگ:
+# TooManyRedirects هنگام لاگین با sessionid (لوپِ ریدایرکتِ www.instagram.com در گراف‌کیوال).
+# این‌ها را هم «خطای شبکه‌ی گذرا» حساب می‌کنیم تا هرگز بی‌صدا بالا نزنند.
+RAW_NETWORK_ERRORS = (requests.exceptions.RequestException,)
 
 # صبرِ اولین بازتلاش بعد از ریت‌لیمیت (ثانیه)
 RATE_LIMIT_WAIT_MIN = 60
 RATE_LIMIT_WAIT_JITTER = 20
+# بعد از مشاهده‌ی ریت‌لیمیت، تا این مدت (ثانیه) درخواستِ جدید بدون تماس با سرور
+# «شکستِ سریع» می‌خورد (RateLimited) — به‌جای اینکه گزارش‌ها یکی‌یکی ددلاین بسوزانند.
+THROTTLE_COOLDOWN = 90.0
 
 
 class LoginMethod(str, Enum):
@@ -78,6 +91,19 @@ class IGClient:
         self.store = SessionStore(settings.session_path, logger=logger)
         self.client: Client = self._build_client()
         self.login_method: Optional[LoginMethod] = None
+        # تا این لحظه (epoch) اکانت/IP «داغ» است و نباید درخواستِ تازه فرستاد
+        self.throttled_until: float = 0.0
+
+    # ------------------------------------------------------------ وضعیت ریت‌لیمیت
+    @property
+    def throttled(self) -> bool:
+        return time.time() < self.throttled_until
+
+    def throttle_remaining(self) -> float:
+        return max(0.0, self.throttled_until - time.time())
+
+    def _mark_throttled(self, seconds: float = THROTTLE_COOLDOWN) -> None:
+        self.throttled_until = max(self.throttled_until, time.time() + seconds)
 
     # ------------------------------------------------------------------ ساخت
     def _build_client(self) -> Client:
@@ -145,25 +171,44 @@ class IGClient:
         except Exception as exc:  # اطلاعاتِ زاید است؛ شکست آن بی‌اهمیت
             logger.debug("دریافت نام کاربری ناموفق بود: %s", exc)
 
-    def _is_alive(self) -> bool:
-        """بررسی سبکِ زنده بودن سشن: یک درخواست به users/{id}/info/"""
+    def _check_session(self) -> str:
+        """بررسی سبکِ اعتبار سشن با API خصوصی (نه وب!).
+
+        ⚠️ طبق سورسِ واقعیِ instagrapi 3.0.2، ``cl.user_info()`` از GraphQLِ عمومیِ
+        www.instagram.com می‌رود (user_info_by_username_gql) که بدون کوکیِ وب لوپِ
+        ریدایرکت / صفحه‌ی HTML برمی‌گرداند (TooManyRedirects / ClientJSONDecodeError).
+        برای سنجشِ سشنِ خصوصی باید از ``user_info_v1`` (اندپوینتِ موبایل
+        ``users/{id}/info/``) استفاده شود — همان مسیرِ لاگینِ خودِ کتابخانه
+        (``login_by_sessionid`` هم با user_info_v1 اعتبارسنجی می‌کند).
+
+        بازگشت:
+          "alive"   — سشن معتبر است
+          "dead"    — سشن قطعاً مرده است (401/چالش/رمز) ⇒ فایل حذف می‌شود
+          "unknown" — خطای شبکه/موقت؛ فایل نگه داشته می‌شود، روش بعدی امتحان می‌شود
+        """
         uid = self.user_id
         if not uid:
-            return False
+            return "dead"
         logger.info("در حال بررسی اعتبار سشن ...")
         try:
-            self.with_transport_fallback(self.client.user_info, uid)
+            self.with_transport_fallback(self.client.user_info_v1, uid)
             logger.info("سشن معتبر است.")
-            return True
+            return "alive"
         except AUTH_ERRORS as exc:
             logger.info("سشن مرده است: %s", type(exc).__name__)
-            return False
+            return "dead"
         except TRANSIENT_ERRORS as exc:
-            logger.warning("بررسی سشن با خطای گذرا مواجه شد (%s)؛ فرض می‌کنیم سالم است.", type(exc).__name__)
-            return True
-        except Exception as exc:
-            logger.warning("بررسی سشن ناموفق بود (%s)", type(exc).__name__)
-            return False
+            logger.warning("بررسی سشن قطعی نبود (%s)؛ فایل سشن نگه داشته می‌شود.",
+                           type(exc).__name__)
+            return "unknown"
+        except RAW_NETWORK_ERRORS as exc:
+            logger.warning("بررسی سشن با خطای شبکه مواجه شد (%s)؛ فایل سشن نگه داشته می‌شود.",
+                           type(exc).__name__)
+            return "unknown"
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("بررسی سشن ناموفق بود (%s)؛ فایل سشن نگه داشته می‌شود.",
+                           type(exc).__name__)
+            return "unknown"
 
     # ------------------------------------------------------------- روش‌های ورود
     def _login_with_session(self) -> bool:
@@ -175,11 +220,13 @@ class IGClient:
             return False
         logger.info("سشن ذخیره‌شده بارگذاری شد (method=%s, age=%s)",
                     data.get("login_method"), _age_str(data.get("saved_at")))
-        if self._is_alive():
+        state = self._check_session()
+        if state == "alive":
             self.login_method = LoginMethod.SESSION
             self._ensure_username()
             return True
-        self.store.delete()  # فقط در صورت اطمینان از مرگِ سشن حذف می‌کنیم
+        if state == "dead":
+            self.store.delete()  # فقط در صورت اطمینان از مرگِ سشن حذف می‌کنیم
         return False
 
     def _login_with_sessionid(self) -> bool:
@@ -194,11 +241,25 @@ class IGClient:
             return True
         except AssertionError:
             logger.error("قالب sessionid اشتباه است (باید با عدد user-id شروع شود و طولش > ۳۰ باشد).")
+        except RATE_LIMITED_ERRORS as exc:
+            # ریت‌لیمیت هنگام لاگین ≠ «sessionid نامعتبر»؛ یعنی اکانت/IP داغ شده.
+            # ادامه دادن به لاگینِ پسورد در همین لحظه فقط آستانه را پایین‌تر می‌آورد.
+            self._mark_throttled()
+            logger.error("اینستاگرام در حال لاگین ریت‌لیمیت کرد (%s)؛ چند دقیقه صبر کنید. "
+                         "درخواست‌های بعدی تا پایانِ پنجره‌ی خنک‌شدن سریع رد می‌شوند.",
+                         type(exc).__name__)
+        except AUTH_ERRORS as exc:
+            logger.error("sessionid از سمت سرور رد شد (%s).", type(exc).__name__)
         except TRANSIENT_ERRORS as exc:
             logger.error("سرور موقتاً پاسخ نداد: %s", type(exc).__name__)
-            raise
+        except RAW_NETWORK_ERRORS as exc:
+            # نمونه‌ی واقعی: TooManyRedirects از گراف‌کیوالِ عمومی در دلِ لاگین.
+            logger.error("خطای شبکه در ورود با sessionid (%s: %s)",
+                         type(exc).__name__, str(exc)[:120])
         except (ClientError, PrivateError) as exc:
             logger.error("sessionid پذیرفته نشد: %s", type(exc).__name__)
+        except Exception as exc:  # noqa: BLE001 — تلاشِ ورود نباید کل زنجیره را بکُشد
+            logger.error("خطای غیرمنتظره در ورود با sessionid (%s)", type(exc).__name__)
         return False
 
     def _resolve_2fa_code(self) -> str:
@@ -237,26 +298,58 @@ class IGClient:
         except ReloginAttemptExceeded:
             logger.error("تعداد تلاش‌های ورود مجدد بیش از حد مجاز است؛ کمی صبر کنید.")
             return False
+        except RATE_LIMITED_ERRORS as exc:
+            # ⚠️ قبل از (ClientError, PrivateError): چون PleaseWaitFewMinutes و
+            # RateLimitError زیرکلاسِ PrivateError هستند و نباید به مسیر legacy بروند.
+            self._mark_throttled()
+            logger.error("اینستاگرام در ورود با پسورد ریت‌لیمیت کرد (%s)؛ چند دقیقه صبر کنید.",
+                         type(exc).__name__)
+            return False
         except (ClientError, PrivateError) as exc:
             logger.warning("مسیر CAA شکست خورد (%s)؛ تلاش با مسیر legacy ...", type(exc).__name__)
+            return self._login_with_legacy(s, verification_code)
+        except RAW_NETWORK_ERRORS as exc:
+            logger.error("خطای شبکه در ورود با پسورد (%s)", type(exc).__name__)
+            return False
+        except Exception as exc:  # noqa: BLE001 — تلاشِ ورود نباید بی‌صدا بالا بزند
+            logger.error("خطای غیرمنتظره در ورود با پسورد (%s: %s)", type(exc).__name__, str(exc)[:160])
+            return False
+
+    def _login_with_legacy(self, s: Settings, verification_code: str) -> bool:
+        """مسیر قدیمیِ لاگین (login_legacy) با مدیریت کاملِ خطاها."""
+        try:
+            self.client.login_legacy(s.username, s.password, verification_code=verification_code)
+            self.login_method = LoginMethod.PASSWORD
+            return True
+        except TwoFactorRequired:
+            code = self._resolve_2fa_code()
+            if not code:
+                logger.error("کد دوعاملی در دسترس نیست.")
+                return False
             try:
-                self.client.login_legacy(s.username, s.password, verification_code=verification_code)
+                self.client.login_legacy(s.username, s.password, verification_code=code)
                 self.login_method = LoginMethod.PASSWORD
                 return True
-            except TwoFactorRequired:
-                code = self._resolve_2fa_code()
-                if not code:
-                    return False
-                try:
-                    self.client.login_legacy(s.username, s.password, verification_code=code)
-                    self.login_method = LoginMethod.PASSWORD
-                    return True
-                except (ClientError, PrivateError) as inner:
-                    logger.error("ورود legacy با ۲FA هم شکست خورد: %s", type(inner).__name__)
-                    return False
             except (ClientError, PrivateError) as inner:
-                logger.error("ورود legacy شکست خورد: %s", type(inner).__name__)
+                logger.error("ورود legacy با ۲FA هم شکست خورد: %s", type(inner).__name__)
                 return False
+            except RAW_NETWORK_ERRORS as inner:
+                logger.error("خطای شبکه در ورود legacy با ۲FA (%s)", type(inner).__name__)
+                return False
+        except RATE_LIMITED_ERRORS as exc:
+            self._mark_throttled()
+            logger.error("اینستاگرام در ورود legacy ریت‌لیمیت کرد (%s)؛ چند دقیقه صبر کنید.",
+                         type(exc).__name__)
+            return False
+        except (ClientError, PrivateError) as exc:
+            logger.error("ورود legacy شکست خورد: %s", type(exc).__name__)
+            return False
+        except RAW_NETWORK_ERRORS as exc:
+            logger.error("خطای شبکه در ورود legacy (%s)", type(exc).__name__)
+            return False
+        except Exception as exc:  # noqa: BLE001
+            logger.error("خطای غیرمنتظره در ورود legacy (%s: %s)", type(exc).__name__, str(exc)[:160])
+            return False
 
     def _retry_password_login(self, code: str) -> bool:
         s = self.settings
@@ -334,6 +427,13 @@ class IGClient:
 
         order = [method] if method else [LoginMethod.SESSION, LoginMethod.SESSIONID, LoginMethod.PASSWORD]
         for candidate in order:
+            # اگر اکانت همین حالا ریت‌لیمیت شده، لاگینِ پسورد/شناسه درخواستِ تازه است
+            # و فقط وضعیت را بدتر می‌کند — به‌جای آن سریع با پیامِ روشن شکست می‌خوریم.
+            if self.throttled and candidate != LoginMethod.SESSION:
+                raise RateLimited(
+                    "اینستاگرام این اکانت/IP را ریت‌لیمیت کرده است؛ "
+                    "ورودِ جدید الان انجام نمی‌شود. چند دقیقه صبر کنید."
+                )
             if candidate == LoginMethod.SESSION and self._login_with_session():
                 return LoginMethod.SESSION
             if candidate == LoginMethod.SESSIONID and self._login_with_sessionid():
@@ -370,7 +470,16 @@ class IGClient:
         استثنای مهم: خطاهای «ریت‌لیمیت» (PleaseWaitFewMinutes / 429 / RateLimit)
         فقط یک بار و بعد از ~۶۰ ثانیه دوباره امتحان می‌شوند؛ بازتلاش‌های ۵-۲۱ ثانیه‌ای
         در این حالت فقط درخواستِ بیشتر به یک اکانتِ محدودشده فرستادن است.
+        اگر آن تلاشِ آخر هم شکست خورد، پنجره‌ی خنک‌شدن فعال می‌شود و درخواست‌های بعدی
+        تا پایانِ آن بدونِ تماس با سرور «شکستِ سریع» می‌خورند (جلوگیری از سوختنِ
+        ددلاینِ گام‌ها یکی‌یکی).
         """
+        remaining = self.throttle_remaining()
+        if remaining > 0:
+            raise RateLimited(
+                "اکانت هنوز در پنجره‌ی خنک‌شدنِ ریت‌لیمیت است "
+                f"(حدود {remaining:.0f} ثانیه مانده). کمی صبر کنید و دوباره امتحان کنید."
+            )
         last_exc: Optional[BaseException] = None
         rate_limited_seen = False
         for attempt in range(1, attempts + 1):
@@ -385,6 +494,7 @@ class IGClient:
                 self.login(fresh=False)
             except RATE_LIMITED_ERRORS as exc:
                 if rate_limited_seen or attempt == attempts:
+                    self._mark_throttled()
                     raise RateLimited(
                         "اینستاگرام هم‌اکنون ریت‌لیمیت کرده است (Please wait a few minutes)."
                     ) from exc
@@ -403,9 +513,19 @@ class IGClient:
                 if attempt == attempts:
                     break
                 time.sleep(wait)
+            except RAW_NETWORK_ERRORS as exc:
+                # استثناهای خامی که خودِ کتابخانه نمی‌پیچد (مثل TooManyRedirects)
+                last_exc = exc
+                wait = 5.0 + random.uniform(0, 3)
+                logger.warning("خطای شبکه (%s: %s)؛ صبر %.1f ثانیه (تلاش %d/%d)",
+                               type(exc).__name__, str(exc)[:120], wait, attempt, attempts)
+                if attempt == attempts:
+                    break
+                time.sleep(wait)
             except UserNotFound:
                 raise
-        assert last_exc is not None
+        if last_exc is None:  # دفاعی؛ در عمل نباید رخ دهد
+            raise ClientError("safe_call بدون نتیجه پایان یافت")
         raise last_exc
 
 

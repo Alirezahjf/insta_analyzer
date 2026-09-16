@@ -15,7 +15,7 @@ import logging
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from instagrapi.exceptions import UserNotFound
+from instagrapi.exceptions import ClientNotFoundError, HashtagNotFound, UserNotFound
 
 from igclient.client import IGClient
 from igclient import profile as prof
@@ -26,13 +26,16 @@ from bot.viral import viral_score
 
 logger = logging.getLogger("igpro.bot.engine")
 
-# مهلت‌ها (ثانیه) — بر اساس زمان‌های واقعیِ مشاهده‌شده (هر درخواستِ خصوصی ~۲۰ ثانیه)
-DL_SESSION = 300.0   # ممکن است لاگین کامل + کد ۲FA/چالش شامل شود
-DL_ID = 60.0         # دریافت شناسه / اطلاعات پیج
-DL_MEDIA = 120.0     # گرفتن لیست پست‌ها
-DL_DETAIL = 45.0     # جزئیاتِ تک‌پست (یک media_info)
-DL_OWNER = 30.0      # یک user_info برای صاحبِ پست
-DL_INSTANT = 10.0    # محاسبات
+# مهلت‌ها (ثانیه). بر اساس سورسِ واقعیِ instagrapi 3.0.2 و لاگ‌های میدانی:
+# هر درخواستِ خصوصی ~۲۰ ثانیه، و بعد از ریت‌لیمیت یک صبرِ ~۶۰-۸۰ ثانیه‌ای داخلِ
+# safe_call ممکن است رخ بدهد. مهلت‌ها طوری انتخاب شده‌اند که این صبرِ مجاز را
+# جا بدهند تا گام به‌اشتباه «سررسید» نشود و پیامِ دوستانه‌ی ریت‌لیمیت برسد.
+DL_SESSION = 300.0      # ممکن است لاگین کامل + کد ۲FA/چالش شامل شود
+DL_ID = 180.0           # اطلاعات پیج / هشتگ (یک درخواست + صبرِ احتمالی)
+DL_MEDIA = 240.0        # گرفتن لیست پست‌ها/ریل‌ها
+DL_DETAIL_EACH = 150.0  # جزئیاتِ هر پست (یک media_info + صبرِ احتمالی)
+DL_OWNER_EACH = 120.0   # یک user_info_v1 برای صاحبِ پست
+DL_INSTANT = 10.0       # محاسبات
 
 
 class ReportError(RuntimeError):
@@ -135,42 +138,51 @@ class IgEngine:
     def page_report_steps(self) -> List[Step]:
         return [
             Step("بررسی/بازسازی سشن اینستاگرام", DL_SESSION),
-            Step("دریافت شناسه‌ی پیج", DL_ID),
             Step("دریافت اطلاعات پیج", DL_ID),
             Step("دریافت ۲ پستِ آخر", DL_MEDIA),
             Step("دریافت ۲ ریلِ آخر", DL_MEDIA),
-            Step("جزئیات دقیق پست‌ها (لایک/کامنت/بازدید)", DL_DETAIL * 2),
+            Step("جزئیات دقیق پست‌ها (لایک/کامنت/بازدید)", DL_DETAIL_EACH * 2),
             Step("محاسبه‌ی Viral Score", DL_INSTANT),
         ]
 
     def page_report(self, username: str, reporter: ProgressReporter) -> Dict[str, Any]:
-        """در رشته‌ی worker اجرا می‌شود. نتیجه: دیکشنریِ کامل گزارش."""
+        """در رشته‌ی worker اجرا می‌شود. نتیجه: دیکشنریِ کامل گزارش.
+
+        ⚠️ مسیرهای جستجو بر اساس سورسِ واقعیِ instagrapi 3.0.2 بازنویسی شده‌اند:
+          - مشخصات پیج با ``user_info_by_username_v1`` گرفته می‌شود (اندپوینتِ خصوصیِ
+            ``users/{username}/usernameinfo/``) — یک درخواست، و برای کاربرِ ناموجود
+            ``UserNotFound`` می‌دهد. ``user_id_from_username`` و ``user_info`` هر دو
+            در 3.0.2 در انتها از گراف‌کیوالِ عمومیِ وب استفاده می‌کنند و پشتِ وی‌پی‌ان
+            با خطاهایی مثل TooManyRedirects شکست می‌خورند.
+        """
         cl = self.ig.client
         username = username.strip().lstrip("@").lower()
         self._ensure_session(reporter, 0)
 
         try:
-            user_id = str(
-                self._run_step(reporter, 1, self.ig.safe_call, cl.user_id_from_username, username)
+            user_raw = self._run_step(
+                reporter, 1, self.ig.safe_call, cl.user_info_by_username_v1, username
             )
         except UserNotFound as exc:
             raise ReportError(
                 f"پیج @{username} پیدا نشد (نام کاربری اشتباه یا پیج حذف‌شده است)."
             ) from exc
 
-        user_raw = self._run_step(reporter, 2, self.ig.safe_call, cl.user_info, user_id)
+        user_id = str(prof._safe(user_raw, "pk", "user_id", "id", default="") or "")
+        if not user_id:
+            raise ReportError(f"شناسه‌ی پیج @{username} از پاسخ اینستاگرام به دست نیامد.")
         profile_data = prof.normalize_user(user_raw)
 
-        medias = self._run_step(reporter, 3, self.ig.safe_call, cl.user_medias, user_id, 2)
+        medias = self._run_step(reporter, 2, self.ig.safe_call, cl.user_medias, user_id, 2)
         clips: List[Any] = []
         clips_note = ""
-        reporter.push({"op": "begin", "i": 4})
+        reporter.push({"op": "begin", "i": 3})
         try:
             clips = list(self.ig.safe_call(cl.user_clips, user_id, 2) or [])
-            reporter.push({"op": "finish", "i": 4, "ok": True})
+            reporter.push({"op": "finish", "i": 3, "ok": True})
         except Exception as exc:  # noqa: BLE001 — ریل ممکن است نباشد
             clips_note = f"دریافت ریل‌ها ناموفق بود ({type(exc).__name__})"
-            reporter.push({"op": "finish", "i": 4, "ok": True, "note": clips_note})
+            reporter.push({"op": "finish", "i": 3, "ok": True, "note": clips_note})
             logger.debug("clips: %s", exc)
 
         posts = self._merge_posts(list(medias or []), clips, amount=2)
@@ -189,7 +201,7 @@ class IgEngine:
                 detailed.append(rich)
             return detailed
 
-        detailed = self._span(reporter, 5, _details)
+        detailed = self._span(reporter, 4, _details)
 
         followers = int(profile_data.get("followers") or 0)
 
@@ -205,7 +217,7 @@ class IgEngine:
                 results.append(stats)
             return results
 
-        results = self._span(reporter, 6, _scores)
+        results = self._span(reporter, 5, _scores)
         total_likes = sum(p["likes"] or 0 for p in results)
         total_comments = sum(p["comments"] or 0 for p in results)
         total_views = sum(p["views"] or 0 for p in results)
@@ -233,22 +245,37 @@ class IgEngine:
             Step("بررسی/بازسازی سشن اینستاگرام", DL_SESSION),
             Step(f"دریافت اطلاعات # {tag}", DL_ID),
             Step(f"دریافت {self.cfg.hashtag_scan} پستِ برتر", DL_MEDIA),
-            Step(f"شناسایی صاحبان {show} پست (برای Viral Score)", DL_OWNER * show),
-            Step(f"جزئیات دقیق {show} پست + Viral Score", DL_DETAIL * show),
+            Step(f"شناسایی صاحبان {show} پست (برای Viral Score)", DL_OWNER_EACH * show),
+            Step(f"جزئیات دقیق {show} پست + Viral Score", DL_DETAIL_EACH * show),
         ]
 
     def hashtag_report(self, tag: str, reporter: ProgressReporter) -> Dict[str, Any]:
-        """در رشته‌ی worker اجرا می‌شود."""
+        """در رشته‌ی worker اجرا می‌شود.
+
+        ⚠️ بررسی‌شده با سورسِ واقعیِ instagrapi 3.0.2 (mixins/hashtag.py):
+          - ``hashtag_info`` → اندپوینتِ خصوصیِ ``tags/{name}/info/``
+          - ``hashtag_medias_top`` → ``tags/{name}/sections/`` با تبِ «top»
+          - نامِ هشتگ نباید «#» داشته باشد (کتابخانه خودش نرمال می‌کند؛ ما هم از قبل
+            برداشته‌ایم) و با یونیکد/فارسی از طریقِ کدگذاریِ خودکارِ requests کار می‌کند.
+        """
         cl = self.ig.client
         show = self.cfg.hashtag_show
         scan = self.cfg.hashtag_scan
         self._ensure_session(reporter, 0)
 
-        info = self._run_step(reporter, 1, self.ig.safe_call, cl.hashtag_info, tag)
+        try:
+            info = self._run_step(reporter, 1, self.ig.safe_call, cl.hashtag_info, tag)
+        except (HashtagNotFound, ClientNotFoundError) as exc:
+            raise ReportError(
+                f"هشتگ #{tag} پیدا نشد (املای اشتباه یا هشتگ حذف‌شده است)."
+            ) from exc
         media_count = int(prof._safe(info, "media_count", default=0) or 0)
         tag_name = str(prof._safe(info, "name", default=tag) or tag)
 
-        medias = self._run_step(reporter, 2, self.ig.safe_call, cl.hashtag_medias_top, tag, scan)
+        try:
+            medias = self._run_step(reporter, 2, self.ig.safe_call, cl.hashtag_medias_top, tag, scan)
+        except (HashtagNotFound, ClientNotFoundError) as exc:
+            raise ReportError(f"هشتگ #{tag} پیدا نشد یا در دسترس نیست.") from exc
         medias = list(medias or [])
         if not medias:
             raise ReportError(
@@ -276,9 +303,10 @@ class IgEngine:
                 full = None
                 if owner_pk:
                     try:
-                        full = self.ig.safe_call(cl.user_info, str(owner_pk))
+                        # user_info_v1 = مسیرِ خصوصی (نه وب) — در برابرِ لوپِ ریدایرکت مقاوم است
+                        full = self.ig.safe_call(cl.user_info_v1, str(owner_pk))
                     except Exception as exc:  # noqa: BLE001 — فالوور نامشخص ⇒ ویروسی «—»
-                        logger.debug("user_info(%s) ناموفق: %s", owner_pk, exc)
+                        logger.debug("user_info_v1(%s) ناموفق: %s", owner_pk, exc)
                     if full is not None:
                         followers = prof._safe(full, "follower_count", default=followers)
                 owners.append(

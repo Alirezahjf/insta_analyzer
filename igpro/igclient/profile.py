@@ -4,6 +4,14 @@
     user_info()  → مدل User     : شامل follower_count / following_count / media_count
     account_info() → مدل Account: شمارنده‌ها را ندارد!
     به همین دلیل خروجی را با getattr و به‌صورت تدافعی می‌خوانیم تا با هر نسخه/مدلی سازگار باشد.
+
+نکته‌ی مهم (طبق سورسِ واقعیِ instagrapi 3.0.2 — mixins/user.py):
+    ``user_info()`` در 3.0.2 از راهِ **وب/گراف‌کیوالِ عمومی** می‌رود
+    (user_info_by_username_gql ← www.instagram.com) که بدون کوکیِ وب ممکن است
+    TooManyRedirects یا صفحه‌ی HTML برگرداند. برای کلاینتِ لاگین‌شده مسیرِ درست
+    ``user_info_v1`` است (اندپوینتِ خصوصیِ موبایل ``users/{id}/info/``) — همان که
+    خودِ ``login_by_sessionid`` برای اعتبارسنجی استفاده می‌کند. فراخوانی‌های این
+    ماژول از مسیرِ خصوصی استفاده می‌کنند.
 """
 from __future__ import annotations
 
@@ -56,15 +64,17 @@ def own_profile(cl: Client) -> Dict[str, Any]:
     user_id = cl.user_id
     if not user_id:
         raise RuntimeError("شناسه‌ی کاربر در دسترس نیست؛ دوباره لاگین کنید (--fresh).")
-    return normalize_user(cl.user_info(user_id))
+    return normalize_user(cl.user_info_v1(user_id))
 
 
 def profile_by_username(cl: Client, username: str) -> Dict[str, Any]:
     username = (username or "").strip().lstrip("@").lower()
     if not username:
         raise ValueError("نام کاربری خالی است (این همان باگی است که 'none' جستجو می‌کرد).")
-    user_id = cl.user_id_from_username(username)
-    return normalize_user(cl.user_info(user_id))
+    # یک درخواست به‌جای دو تا: user_info_by_username_v1 هم شناسه و هم مشخصات را
+    # از اندپوینتِ خصوصیِ ``users/{username}/usernameinfo/`` برمی‌گرداند و برای
+    # کاربرِ ناموجود UserNotFound می‌دهد (بدون لمسِ وب).
+    return normalize_user(cl.user_info_by_username_v1(username))
 
 
 def followers(cl: Client, user_id: str, amount: int = 0) -> List[Dict[str, Any]]:
@@ -225,9 +235,10 @@ def last_posts(cl: Client, target: str, amount: int = 2, detail: bool = True,
         owner = normalize_user(_safe(media, "user", default=None))
     else:
         logger.info("دریافت شناسه‌ی کاربر %s ...", value)
-        user_id = str(cl.user_id_from_username(value))
+        user_raw = cl.user_info_by_username_v1(value)
+        user_id = str(_safe(user_raw, "pk", "user_id", "id", default="") or "")
         logger.info("دریافت مشخصات پیج ...")
-        owner = normalize_user(cl.user_info(user_id))
+        owner = normalize_user(user_raw)
         posts = _collect_media(cl, user_id, amount, include_reels)
         if not posts:
             logger.warning("هیچ پستی برای %s پیدا نشد (پیج خصوصی؟ یا فقط ریل دارد؟)", value)

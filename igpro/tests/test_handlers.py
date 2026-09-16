@@ -264,3 +264,48 @@ def test_admin_id_env_forced(env):
         db.close()
 
     asyncio.run(scenario())
+
+
+def test_authentication_error_friendly_message(tmp_path):
+    """شکستِ کاملِ احراز هویت ⇒ پیامِ دوستانه، نه «خطای غیرمنتظره»."""
+    from igclient.client import AuthenticationError
+
+    async def scenario():
+        bot = FakeBot()
+        db = Database(tmp_path / "bot.db")
+        ig = FakeIG(make_page_fixture(),
+                    login_side_effect=AuthenticationError("هیچ روشی موفق نبود"))
+        ig.login_method = None  # تا موتور واقعاً لاگین کند
+        engine = IgEngine(ig, make_settings(tmp_path))
+        router = build_router(make_settings(tmp_path), db, engine)
+        dp = Dispatcher(storage=MemoryStorage())
+        dp.include_router(router)
+
+        counter = [0]
+
+        def upd(text):
+            counter[0] += 1
+            return text_update(bot, ADMIN, text, counter)
+
+        await dp.feed_update(bot=bot, update=upd("/start"))
+        await dp.feed_update(bot=bot, update=upd("/page nima.arish"))
+        last = bot.last_sent(ADMIN)
+        assert "ورود به اینستاگرام" in last["text"], last["text"]
+        assert db.list_history(ADMIN)[0]["status"] == "auth_error"
+        db.close()
+
+    asyncio.run(scenario())
+
+
+def test_cancel_outside_state_is_unknown_command(env):
+    """/cancel بدون state فعال باید به فالبک بیفتد (نه اینکه کروتینش معلق بماند)."""
+    async def scenario():
+        bot, db, counter = env["bot"], env["db"], env["counter"]
+        await feed(env, text_update(bot, ADMIN, "/start", counter))
+        await feed(env, text_update(bot, ADMIN, "/cancel", counter))
+        last = bot.last_sent(ADMIN)
+        assert "لغو شد" not in last["text"]
+        assert "ناشناس" in last["text"], last["text"]
+        db.close()
+
+    asyncio.run(scenario())

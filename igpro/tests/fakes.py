@@ -25,6 +25,7 @@ class FakeBot:
         self.edited: List[Dict[str, Any]] = []    # editMessageText
         self.callback_answers: List[Dict[str, Any]] = []
         self.deleted: List[Dict[str, Any]] = []
+        self.registered_commands: List[tuple] = []  # آخرین منوی دستوراتِ ثبت‌شده
         self._next_id = 1
         self._messages: Dict[int, Dict[str, Any]] = {}
 
@@ -47,6 +48,13 @@ class FakeBot:
                 chat_id=chat_id, message_id=message_id, text=text, reply_markup=reply_markup
             )
         )
+
+    async def set_my_commands(self, commands: Any, **kw: Any) -> Any:
+        from aiogram.methods import SetMyCommands
+        self.registered_commands = [
+            (c.command, c.description) for c in commands
+        ]
+        return await self(SetMyCommands(commands=commands))
 
     # ------------------------------------------------------------ API اصلی
     async def __call__(self, method: Any) -> Any:
@@ -206,6 +214,24 @@ class FakeIgClient:
             if str(info["id"]) == str(user_id):
                 return info["user"]
         raise UserNotFound(f"user {user_id} not found")
+
+    def user_info_v1(self, user_id: str) -> SimpleNamespace:
+        """مسیرِ خصوصیِ 3.0.2 — در فیک همان نتیجه‌ی user_info را دارد."""
+        self.calls.append(f"user_info_v1:{user_id}")
+        self._sleep()
+        for info in self.users.values():
+            if str(info["id"]) == str(user_id):
+                return info["user"]
+        raise UserNotFound(f"user {user_id} not found")
+
+    def user_info_by_username_v1(self, username: str) -> SimpleNamespace:
+        """اندپوینتِ خصوصیِ ``users/{username}/usernameinfo/`` در 3.0.2."""
+        self.calls.append(f"user_info_by_username_v1:{username}")
+        self._sleep()
+        info = self.users.get(username)
+        if info is None:
+            raise UserNotFound(f"user {username} not found")
+        return info["user"]
 
     def user_medias(self, user_id: str, amount: int = 0) -> List[Any]:
         self.calls.append(f"user_medias:{user_id}:{amount}")
